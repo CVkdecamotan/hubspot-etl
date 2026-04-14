@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -70,10 +71,17 @@ def get_month_range_ms():
 
 
 def get_sheets_client():
-    if not os.path.isfile(GOOGLE_SA_JSON):
-        raise FileNotFoundError(f"JSON file not found: {GOOGLE_SA_JSON}")
+    if not GOOGLE_SA_JSON:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is missing")
 
-    creds = Credentials.from_service_account_file(GOOGLE_SA_JSON, scopes=SCOPES)
+    if GOOGLE_SA_JSON.strip().startswith("{"):
+        info = json.loads(GOOGLE_SA_JSON)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    else:
+        if not os.path.isfile(GOOGLE_SA_JSON):
+            raise FileNotFoundError(f"JSON file not found: {GOOGLE_SA_JSON}")
+        creds = Credentials.from_service_account_file(GOOGLE_SA_JSON, scopes=SCOPES)
+
     return gspread.authorize(creds)
 
 
