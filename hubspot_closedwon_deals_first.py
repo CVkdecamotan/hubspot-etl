@@ -74,14 +74,17 @@ def get_sheets_client():
     if not GOOGLE_SA_JSON:
         raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is missing")
 
-    if GOOGLE_SA_JSON.strip().startswith("{"):
+    try:
         info = json.loads(GOOGLE_SA_JSON)
         creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    else:
-        if not os.path.isfile(GOOGLE_SA_JSON):
-            raise FileNotFoundError(f"JSON file not found: {GOOGLE_SA_JSON}")
-        creds = Credentials.from_service_account_file(GOOGLE_SA_JSON, scopes=SCOPES)
+        return gspread.authorize(creds)
+    except Exception:
+        pass
 
+    if not os.path.isfile(GOOGLE_SA_JSON):
+        raise FileNotFoundError(f"JSON file not found: {GOOGLE_SA_JSON}")
+
+    creds = Credentials.from_service_account_file(GOOGLE_SA_JSON, scopes=SCOPES)
     return gspread.authorize(creds)
 
 
