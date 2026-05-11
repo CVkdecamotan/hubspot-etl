@@ -1,5 +1,5 @@
-hubspot-api-client
-gspread
-google-auth
-pandas
-python-dotenv
+gspread==6.1.4
+hubspot-api-client==12.0.0
+pandas==2.2.3
+python-dotenv==1.0.1
+google-auth==2.36.0
