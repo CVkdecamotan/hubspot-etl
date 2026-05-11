@@ -1,0 +1,87 @@
+{
+    "google_sheet_tab": "ETL - Automation",
+    "jobs": [
+          {
+                  "job_name": "All Deals with Referral value",
+                  "google_sheet_tab": "All Deals with Referral value",
+                  "page_size": 100,
+                  "primary_object": "deals",
+                  "primary_properties": [
+                            "closedate",
+                            "hubspot_owner_id",
+                            "product",
+                            "amount",
+                            "referred_by_hubspot"
+                  ],
+                  "filters": [
+                            {
+                                        "property": "closedate",
+                                        "operator": "BETWEEN",
+                                        "value": "{{month_start_ms}}",
+                                        "high_value": "{{today_end_ms}}"
+                            },
+                            {
+                                        "property": "referred_by_hubspot",
+                                        "operator": "HAS_PROPERTY"
+                            }
+                  ],
+                  "output_columns": [
+                            {
+                                        "header": "Close Date - Daily",
+                                        "source": "primary",
+                                        "property": "closedate",
+                                        "format": "date"
+                            },
+                            {
+                                        "header": "Deal Owner",
+                                        "source": "primary",
+                                        "property": "hubspot_owner_id",
+                                        "lookup": "owner"
+                            },
+                            {
+                                        "header": "Product",
+                                        "source": "primary",
+                                        "property": "product"
+                            },
+                            {
+                                        "header": "Amount",
+                                        "source": "primary",
+                                        "property": "amount"
+                            },
+                            {
+                                        "header": "Referred by HubSpot",
+                                        "source": "primary",
+                                        "property": "referred_by_hubspot",
+                                        "lookup": "owner"
+                            }
+                  ],
+                  "aggregate": {
+                            "group_by": [
+                                        "Close Date - Daily",
+                                        "Deal Owner",
+                                        "Product",
+                                        "Referred by HubSpot"
+                            ],
+                            "aggregations": [
+                                        {
+                                                      "header": "(COUNT) Deals",
+                                                      "function": "count"
+                                        },
+                                        {
+                                                      "header": "Amount",
+                                                      "function": "sum",
+                                                      "source_column": "Amount"
+                                        }
+                            ],
+                            "output_order": [
+                                        "Close Date - Daily",
+                                        "Deal Owner",
+                                        "(COUNT) Deals",
+                                        "Product",
+                                        "Amount",
+                                        "Referred by HubSpot"
+                            ]
+                  }
+          }
+    ]
+}
