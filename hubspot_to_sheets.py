@@ -66,10 +66,15 @@ def load_config():
     return config
 
 
-def get_month_range_ms():
+def get_month_range():
     now = datetime.now(timezone.utc)
     start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
     end = datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=timezone.utc)
+    return start, end
+
+
+def get_month_range_ms():
+    start, end = get_month_range()
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
@@ -134,7 +139,9 @@ def get_owner_map(client):
 
 
 def replace_dynamic_value(value):
-    start_ms, end_ms = get_month_range_ms()
+    start, end = get_month_range()
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
     replacements = {
         "{{month_start_ms}}": str(start_ms),
         "{{today_end_ms}}": str(end_ms),
