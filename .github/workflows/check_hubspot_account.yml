@@ -1,0 +1,39 @@
+name: Check HubSpot account identity (read only)
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  check-account:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compare configured HubSpot account with intended portal
+        env:
+          HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          token = os.environ['HUBSPOT_ACCESS_TOKEN']
+          request = urllib.request.Request(
+              'https://api.hubapi.com/oauth/v2/private-apps/get/access-token-info',
+              data=json.dumps({'tokenKey': token}).encode(),
+              headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token})
+          try:
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  info = json.load(response)
+              portal_id = info.get('hubId')
+              if portal_id is None:
+                  raise RuntimeError('Token response did not contain an account ID')
+              matches = str(portal_id) == '6592891'
+              message = ('Configured token belongs to intended Cardone Ventures account: '
+                         + str(matches))
+              print(message)
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write(message + '\n\nRead-only check. No Sheets data changed.\n')
+          except urllib.error.HTTPError as error:
+              print('::error::Account identity check failed with HTTP ' + str(error.code))
+              raise SystemExit(1)
+          PY
