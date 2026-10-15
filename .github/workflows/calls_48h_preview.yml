@@ -26,6 +26,8 @@ jobs:
         env:
           HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
           GH_TOKEN: ${{ github.token }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SHEET_TAB: "Calls Data"
         shell: bash
         run: |
           python - <<'PY'
@@ -182,6 +184,10 @@ jobs:
               hubspot_token = os.environ.get("HUBSPOT_ACCESS_TOKEN")
               if not hubspot_token:
                   raise RuntimeError("Missing HUBSPOT_ACCESS_TOKEN repository secret")
+              if not os.environ.get("GOOGLE_SHEET_ID"):
+                  raise RuntimeError("Missing existing GOOGLE_SHEET_ID repository secret")
+              if os.environ.get("GOOGLE_SHEET_TAB") != "Calls Data":
+                  raise RuntimeError("Unexpected destination tab")
               # The run creation timestamp stays fixed on reruns, including after midnight.
               run = request_json(
                   "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"]
@@ -208,6 +214,7 @@ jobs:
                          "Columns: " + " | ".join(HEADERS),
                          "Scope: all assignees and teams; call objects only.",
                          "Timezone: America/Phoenix; preceding 48 hours ending at run-date midnight.",
+                         "Destination: existing GOOGLE_SHEET_ID spreadsheet; tab Calls Data.",
                          "Google Sheets: no connection, clearing, adding, or writing performed.",
                          "CRM record data and counts are not published."]
               if issues:
