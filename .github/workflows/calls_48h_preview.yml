@@ -1,0 +1,231 @@
+name: Calls 48h - Validate Only (Sheets On Hold)
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # Midnight America/Phoenix (UTC-07:00)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: hubspot-calls-48h-preview
+  cancel-in-progress: false
+
+jobs:
+  validate-calls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fetch and validate calls - STOP before Sheets write
+        env:
+          HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          """Read and validate a calls snapshot; intentionally contains no Sheets writer."""
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+          from zoneinfo import ZoneInfo
+          
+          TZ = ZoneInfo("America/Phoenix")
+          HEADERS = ["Activity assigned to", "Activity type", "Activity Date", "HubSpot team name"]
+          
+          
+          def request_json(url, token, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              for attempt in range(6):
+                  request = urllib.request.Request(url, data=data, headers={
+                      "Authorization": "Bearer " + token,
+                      "Content-Type": "application/json",
+                      "Accept": "application/json",
+                  })
+                  try:
+                      with urllib.request.urlopen(request, timeout=60) as response:
+                          return json.load(response)
+                  except urllib.error.HTTPError as exc:
+                      if exc.code not in (429, 500, 502, 503, 504) or attempt == 5:
+                          # Never echo response bodies, which may contain CRM data.
+                          raise RuntimeError("API request failed with HTTP " + str(exc.code)) from None
+                      retry_after = exc.headers.get("Retry-After", "")
+                      delay = float(retry_after) if retry_after.isdigit() else 2 ** attempt
+                      time.sleep(min(delay, 120))
+                  except (urllib.error.URLError, TimeoutError):
+                      if attempt == 5:
+                          raise RuntimeError("API request failed after network retries") from None
+                      time.sleep(2 ** attempt)
+          
+          
+          def reporting_window(created_at):
+              anchor = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+              end = anchor.astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+              end = end.astimezone(timezone.utc)
+              return end - timedelta(hours=48), end
+          
+          
+          def parse_date(value):
+              text = str(value)
+              if text.isdigit():
+                  return datetime.fromtimestamp(int(text) / 1000, timezone.utc)
+              return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+          
+          
+          def paged(api, path):
+              result = []
+              seen = set()
+              while True:
+                  response = api(path)
+                  result.extend(response.get("results", []))
+                  after = response.get("paging", {}).get("next", {}).get("after")
+                  if after is None:
+                      return result
+                  if str(after) in seen:
+                      raise RuntimeError("Repeated pagination cursor")
+                  seen.add(str(after))
+                  separator = "&" if "?" in path else "?"
+                  # Replace the previous cursor instead of adding duplicate query keys.
+                  base = path.split("&after=")[0].split("?after=")[0]
+                  path = base + ("&" if "?" in base else "?") + "after=" + urllib.parse.quote(str(after))
+          
+          
+          def fetch_calls(api, start_ms, end_ms, properties):
+              def search(after=None):
+                  payload = {
+                      "filterGroups": [{"filters": [
+                          {"propertyName": "hs_timestamp", "operator": "GTE", "value": str(start_ms)},
+                          {"propertyName": "hs_timestamp", "operator": "LT", "value": str(end_ms)},
+                      ]}],
+                      "properties": properties,
+                      "sorts": ["hs_timestamp"],
+                      "limit": 200,
+                  }
+                  if after is not None:
+                      payload["after"] = after
+                  # Keep below the CRM search request rate limit.
+                  time.sleep(0.25)
+                  return api("/crm/v3/objects/calls/search", payload)
+          
+              response = search()
+              if response.get("total", 0) >= 10000:
+                  midpoint = (start_ms + end_ms) // 2
+                  if midpoint <= start_ms:
+                      raise RuntimeError("Call volume exceeds the search limit at millisecond granularity")
+                  return (fetch_calls(api, start_ms, midpoint, properties)
+                          + fetch_calls(api, midpoint, end_ms, properties))
+              records = list(response.get("results", []))
+              expected = response.get("total", len(records))
+              seen = set()
+              while True:
+                  after = response.get("paging", {}).get("next", {}).get("after")
+                  if after is None:
+                      break
+                  if str(after) in seen:
+                      raise RuntimeError("Repeated calls pagination cursor")
+                  seen.add(str(after))
+                  response = search(after)
+                  records.extend(response.get("results", []))
+              if len(records) != expected:
+                  raise RuntimeError("Calls changed during pagination; retry the snapshot")
+              return records
+          
+          
+          def normalize(records, owners, team_names, start, end):
+              rows = []
+              seen = set()
+              issues = set()
+              for call in records:
+                  call_id = str(call["id"])
+                  if call_id in seen:
+                      raise RuntimeError("Duplicate call ID during pagination; retry the snapshot")
+                  seen.add(call_id)
+                  prop = call.get("properties", {})
+                  activity_date = parse_date(prop["hs_timestamp"])
+                  if not start <= activity_date < end:
+                      raise RuntimeError("Call Activity Date is outside the reporting window")
+                  owner_id = str(prop.get("hubspot_owner_id") or "")
+                  owner = owners.get(owner_id)
+                  assignee = "Unassigned" if not owner_id else ""
+                  if owner:
+                      assignee = (owner.get("firstName", "") + " " + owner.get("lastName", "")).strip()
+                      assignee = assignee or owner.get("email", "") or owner_id
+                  elif owner_id:
+                      issues.add("Unresolved activity assignee")
+                  team_id = str(prop.get("hubspot_team_id") or "")
+                  team = team_names.get(team_id, "") if team_id else ""
+                  if team_id and not team:
+                      issues.add("Unresolved call HubSpot team ID")
+                  elif not team_id and owner:
+                      # Explicit current-owner fallback; do not imply historical team membership.
+                      primary = [item for item in owner.get("teams", []) if item.get("primary")]
+                      if len(primary) == 1:
+                          team = primary[0].get("name", "")
+                          issues.add("Team derived from assignee current primary team; review mapping")
+                      elif owner.get("teams"):
+                          issues.add("Ambiguous assignee primary team")
+                  rows.append((call_id, [assignee, "Call", activity_date.astimezone(TZ).isoformat(), team]))
+              rows.sort(key=lambda item: (item[1][2], item[0]))
+              return [row for _, row in rows], sorted(issues)
+          
+          
+          def main():
+              hubspot_token = os.environ.get("HUBSPOT_ACCESS_TOKEN")
+              if not hubspot_token:
+                  raise RuntimeError("Missing HUBSPOT_ACCESS_TOKEN repository secret")
+              # The run creation timestamp stays fixed on reruns, including after midnight.
+              run = request_json(
+                  "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"]
+                  + "/actions/runs/" + os.environ["GITHUB_RUN_ID"], os.environ["GH_TOKEN"])
+              start, end = reporting_window(run["created_at"])
+              def api(path, payload=None):
+                  return request_json("https://api.hubapi.com" + path, hubspot_token, payload)
+              schema = {p["name"]: p for p in api("/crm/v3/properties/calls")["results"]}
+              properties = ["hs_timestamp", "hubspot_owner_id"]
+              if any(name not in schema for name in properties):
+                  raise RuntimeError("Required call Activity Date or assignee property unavailable")
+              if "hubspot_team_id" in schema:
+                  properties.append("hubspot_team_id")
+              owner_list = paged(api, "/crm/v3/owners?limit=100&archived=false")
+              owner_list += paged(api, "/crm/v3/owners?limit=100&archived=true")
+              owners = {str(owner["id"]): owner for owner in owner_list}
+              teams = {str(t["id"]): t["name"] for owner in owner_list for t in owner.get("teams", [])}
+              for option in schema.get("hubspot_team_id", {}).get("options", []):
+                  teams[str(option["value"])] = option["label"]
+              calls = fetch_calls(api, int(start.timestamp() * 1000), int(end.timestamp() * 1000), properties)
+              rows, issues = normalize(calls, owners, teams, start, end)
+              # Data stays in process memory. No CRM rows, counts, or owner/team names in public logs/artifacts.
+              summary = ["## Calls validation: stopped before Google Sheets",
+                         "Columns: " + " | ".join(HEADERS),
+                         "Scope: all assignees and teams; call objects only.",
+                         "Timezone: America/Phoenix; preceding 48 hours ending at run-date midnight.",
+                         "Google Sheets: no connection, clearing, adding, or writing performed.",
+                         "CRM record data and counts are not published."]
+              if issues:
+                  summary += ["Mapping review required:"] + ["- " + issue for issue in issues]
+              else:
+                  summary.append("Field mapping validation completed; write stage remains on hold.")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
+                  stream.write("\n\n".join(summary) + "\n")
+              print("Calls validation completed. Stopped before the Google Sheets write stage.")
+              for issue in issues:
+                  print("Mapping review: " + issue)
+          
+          
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as exc:
+                  # Suppress exception values/tracebacks that might include CRM responses.
+                  print("::error::Calls validation failed (" + type(exc).__name__ + "). No Sheets write was attempted.")
+                  raise SystemExit(1)
+          PY
