@@ -36,6 +36,7 @@ jobs:
           python - <<'PY'
           """Replace the Calls Data snapshot after fetching and validating all calls."""
           import json
+          import math
           import os
           import time
           import urllib.error
@@ -45,7 +46,7 @@ jobs:
           from zoneinfo import ZoneInfo
           
           TZ = ZoneInfo("America/Phoenix")
-          HEADERS = ["Activity assigned to", "Activity type", "Activity Date", "HubSpot team name"]
+          HEADERS = ["Activity assigned to", "Activity type", "Activity Date", "HubSpot team name", "Call duration (seconds)", "Call outcome"]
           
           
           def request_json(url, token, payload=None):
@@ -160,7 +161,9 @@ jobs:
               return records
           
           
-          def normalize(records, owners, team_names, start, end):
+          def normalize(records, owners, team_names, start, end, activity_types=None, dispositions=None):
+              activity_types = activity_types or {}
+              dispositions = dispositions or {}
               rows = []
               seen = set()
               issues = set()
@@ -193,7 +196,15 @@ jobs:
                           issues.add("Team derived from assignee current primary team; review mapping")
                       elif owner.get("teams"):
                           issues.add("Ambiguous assignee primary team")
-                  rows.append((call_id, [assignee, "Call", activity_date.astimezone(TZ).isoformat(), team]))
+                  activity_type = prop.get("hs_activity_type") or ""
+                  disposition = prop.get("hs_call_disposition") or ""
+                  raw_duration = prop.get("hs_call_duration")
+                  duration = "" if raw_duration in (None, "") else float(raw_duration) / 1000
+                  if duration != "" and (not math.isfinite(duration) or duration < 0):
+                      raise RuntimeError("Invalid call duration; existing sheet preserved")
+                  rows.append((call_id, [assignee, activity_types.get(activity_type, activity_type),
+                                        activity_date.astimezone(TZ).isoformat(), team, duration,
+                                        dispositions.get(disposition, disposition)]))
               rows.sort(key=lambda item: (item[1][2], item[0]))
               return [row for _, row in rows], sorted(issues)
           
@@ -208,9 +219,9 @@ jobs:
               if needed > grid["rowCount"]:
                   requests.append({"appendDimension": {"sheetId": sheet_id, "dimension": "ROWS",
                                                        "length": needed - grid["rowCount"]}})
-              if grid["columnCount"] < 4:
+              if grid["columnCount"] < len(HEADERS):
                   requests.append({"appendDimension": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                                                       "length": 4 - grid["columnCount"]}})
+                                                       "length": len(HEADERS) - grid["columnCount"]}})
               data = [{"values": [{"userEnteredValue": {"stringValue": h}} for h in HEADERS]}]
               epoch = datetime(1899, 12, 30)
               for row in rows:
@@ -218,12 +229,13 @@ jobs:
                   date_serial = (local - epoch).total_seconds() / 86400
                   data.append({"values": [
                       {"userEnteredValue": {"numberValue": date_serial}} if index == 2
+                      else {"userEnteredValue": {"numberValue": value}} if index == 4 and value != ""
                       else {"userEnteredValue": {"stringValue": str(value)}}
                       for index, value in enumerate(row)]})
-              # An explicit range clears stale trailing values in A:D within this same atomic request.
+              # An explicit range clears stale trailing values in A:F within this same atomic request.
               requests.append({"updateCells": {
                   "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": total_rows,
-                            "startColumnIndex": 0, "endColumnIndex": 4},
+                            "startColumnIndex": 0, "endColumnIndex": len(HEADERS)},
                   "rows": data, "fields": "userEnteredValue"}})
               requests.append({"repeatCell": {
                   "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": total_rows,
@@ -233,13 +245,13 @@ jobs:
                   "fields": "userEnteredFormat.numberFormat"}})
               requests.append({"repeatCell": {
                   "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
-                            "startColumnIndex": 0, "endColumnIndex": 4},
+                            "startColumnIndex": 0, "endColumnIndex": len(HEADERS)},
                   "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
                   "fields": "userEnteredFormat.textFormat.bold"}})
               requests.append({"updateSheetProperties": {
                   "properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": 1}},
                   "fields": "gridProperties.frozenRowCount"}})
-              for column, width in enumerate([230, 120, 190, 240]):
+              for column, width in enumerate([230, 180, 190, 240, 190, 210]):
                   requests.append({"updateDimensionProperties": {
                       "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
                                 "startIndex": column, "endIndex": column + 1},
@@ -273,11 +285,11 @@ jobs:
                   raise RuntimeError("Snapshot requires staging because its payload exceeds the direct-write limit")
               print("Stage: atomic Calls Data replacement")
               request_json(base + ":batchUpdate", credentials.token, batch)
-              # Read back and compare all four columns, including trailing blank rows.
+              # Read back and compare all six columns, including trailing blank rows.
               print("Stage: verify written snapshot")
-              result = request_json(base + "/values/" + urllib.parse.quote("'Calls Data'!A:D", safe="")
+              result = request_json(base + "/values/" + urllib.parse.quote("'Calls Data'!A:F", safe="")
                                     + "?valueRenderOption=UNFORMATTED_VALUE", credentials.token)
-              actual = [row + [""] * (4 - len(row)) for row in result.get("values", [])]
+              actual = [row + [""] * (len(HEADERS) - len(row)) for row in result.get("values", [])]
               expected = [[cell["userEnteredValue"].get("stringValue",
                               cell["userEnteredValue"].get("numberValue")) for cell in row["values"]]
                           for row in batch["requests"][next(i for i,r in enumerate(batch["requests"]) if "updateCells" in r)]
@@ -285,8 +297,8 @@ jobs:
               if len(actual) != len(expected):
                   raise RuntimeError("Sheets readback row count differs from written snapshot")
               for a, e in zip(actual, expected):
-                  for index in range(4):
-                      if index == 2 and isinstance(e[index], (int, float)):
+                  for index in range(len(HEADERS)):
+                      if index in (2, 4) and isinstance(e[index], (int, float)):
                           if not isinstance(a[index], (int, float)) or abs(a[index] - e[index]) > 1e-8:
                               raise RuntimeError("Sheets date readback differs")
                       elif a[index] != e[index]:
@@ -306,6 +318,7 @@ jobs:
                   hubspot_token, {"tokenKey": hubspot_token})
               if str(identity.get("hubId")) != "6592891":
                   raise RuntimeError("HubSpot account mismatch: calls require the intended Cardone Ventures account")
+              print("HubSpot account verified: intended Cardone Ventures portal")
               # The run creation timestamp stays fixed on reruns, including after midnight.
               run = request_json(
                   "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"]
@@ -314,7 +327,7 @@ jobs:
               def api(path, payload=None):
                   return request_json("https://api.hubapi.com" + path, hubspot_token, payload)
               schema = {p["name"]: p for p in api("/crm/v3/properties/calls")["results"]}
-              properties = ["hs_timestamp", "hubspot_owner_id"]
+              properties = ["hs_timestamp", "hs_activity_type", "hubspot_owner_id", "hs_call_duration", "hs_call_disposition"]
               if any(name not in schema for name in properties):
                   raise RuntimeError("Required call Activity Date or assignee property unavailable")
               if "hubspot_team_id" in schema:
@@ -327,7 +340,17 @@ jobs:
                   teams[str(option["value"])] = option["label"]
               print("Stage: retrieve calls within Activity Date window")
               calls = fetch_calls(api, int(start.timestamp() * 1000), int(end.timestamp() * 1000), properties)
-              rows, issues = normalize(calls, owners, teams, start, end)
+              activity_types = {o["value"]: o["label"] for o in schema["hs_activity_type"].get("options", [])}
+              dispositions = {
+                  "9d9162e7-6cf3-4944-bf63-4dff82258764": "Busy",
+                  "f240bbac-87c9-4f6e-bf70-924b57d47db7": "Connected",
+                  "a4c4c377-d246-4b32-a13b-75a56a4cd0ff": "Left live message",
+                  "b2cf5968-551e-4856-9783-52b3da59a7d0": "Left voicemail",
+                  "73a0d17f-1163-4015-bdd5-ec830791da20": "No answer",
+                  "17b47fee-58de-441e-a44c-c6300d46f273": "Wrong number",
+              }
+              dispositions.update({o["value"]: o["label"] for o in schema["hs_call_disposition"].get("options", [])})
+              rows, issues = normalize(calls, owners, teams, start, end, activity_types, dispositions)
               if any(issue != "Team derived from assignee current primary team; review mapping" for issue in issues):
                   raise RuntimeError("Unresolved owner or team mapping; existing sheet preserved")
               write_snapshot(rows)
