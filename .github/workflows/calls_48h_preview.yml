@@ -28,7 +28,7 @@ jobs:
         env:
           HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
           GH_TOKEN: ${{ github.token }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SHEET_ID: ${{ secrets.CALLS_GOOGLE_SHEET_ID }}
           GOOGLE_SHEET_TAB: "Calls Data"
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         shell: bash
@@ -335,6 +335,7 @@ jobs:
                   main()
               except Exception as exc:
                   # Suppress exception values/tracebacks that might include CRM responses.
-                  print("::error::Calls refresh failed (" + type(exc).__name__ + "). Check the failed stage before rerunning.")
+                  detail = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+                  print("::error::Calls refresh failed: " + detail)
                   raise SystemExit(1)
           PY
