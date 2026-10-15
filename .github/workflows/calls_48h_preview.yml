@@ -350,6 +350,11 @@ jobs:
                   "17b47fee-58de-441e-a44c-c6300d46f273": "Wrong number",
               }
               dispositions.update({o["value"]: o["label"] for o in schema["hs_call_disposition"].get("options", [])})
+              print("Stage: resolve account call outcome labels")
+              outcome_catalog = api("/calling/v1/dispositions")
+              if isinstance(outcome_catalog, dict):
+                  outcome_catalog = outcome_catalog.get("results", [])
+              dispositions.update({str(o["id"]): o["label"] for o in outcome_catalog})
               rows, issues = normalize(calls, owners, teams, start, end, activity_types, dispositions)
               if any(issue != "Team derived from assignee current primary team; review mapping" for issue in issues):
                   raise RuntimeError("Unresolved owner or team mapping; existing sheet preserved")
