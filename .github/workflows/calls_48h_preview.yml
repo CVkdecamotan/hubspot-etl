@@ -1,4 +1,4 @@
-name: Calls 48h - Validate Only (Sheets On Hold)
+name: Calls 48h - Refresh Calls Data
 
 on:
   schedule:
@@ -22,16 +22,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Fetch and validate calls - STOP before Sheets write
+      - name: Install Google authentication dependency
+        run: pip install google-auth==2.36.0 requests==2.32.5
+      - name: Fetch, validate, replace Calls Data and verify
         env:
           HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
           GH_TOKEN: ${{ github.token }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SHEET_TAB: "Calls Data"
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         shell: bash
         run: |
           python - <<'PY'
-          """Read and validate a calls snapshot; intentionally contains no Sheets writer."""
+          """Replace the Calls Data snapshot after fetching and validating all calls."""
           import json
           import os
           import time
@@ -180,6 +183,101 @@ jobs:
               return [row for _, row in rows], sorted(issues)
           
           
+          
+          def build_sheet_update(sheet, rows):
+              grid = sheet["gridProperties"]
+              needed = len(rows) + 1
+              total_rows = max(grid["rowCount"], needed)
+              sheet_id = sheet["sheetId"]
+              requests = []
+              if needed > grid["rowCount"]:
+                  requests.append({"appendDimension": {"sheetId": sheet_id, "dimension": "ROWS",
+                                                       "length": needed - grid["rowCount"]}})
+              if grid["columnCount"] < 4:
+                  requests.append({"appendDimension": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                                                       "length": 4 - grid["columnCount"]}})
+              data = [{"values": [{"userEnteredValue": {"stringValue": h}} for h in HEADERS]}]
+              epoch = datetime(1899, 12, 30)
+              for row in rows:
+                  local = parse_date(row[2]).astimezone(TZ).replace(tzinfo=None)
+                  date_serial = (local - epoch).total_seconds() / 86400
+                  data.append({"values": [
+                      {"userEnteredValue": {"numberValue": date_serial}} if index == 2
+                      else {"userEnteredValue": {"stringValue": str(value)}}
+                      for index, value in enumerate(row)]})
+              # An explicit range clears stale trailing values in A:D within this same atomic request.
+              requests.append({"updateCells": {
+                  "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": total_rows,
+                            "startColumnIndex": 0, "endColumnIndex": 4},
+                  "rows": data, "fields": "userEnteredValue"}})
+              requests.append({"repeatCell": {
+                  "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": total_rows,
+                            "startColumnIndex": 2, "endColumnIndex": 3},
+                  "cell": {"userEnteredFormat": {"numberFormat": {
+                      "type": "DATE_TIME", "pattern": "yyyy-mm-dd hh:mm:ss"}}},
+                  "fields": "userEnteredFormat.numberFormat"}})
+              requests.append({"repeatCell": {
+                  "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                            "startColumnIndex": 0, "endColumnIndex": 4},
+                  "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                  "fields": "userEnteredFormat.textFormat.bold"}})
+              requests.append({"updateSheetProperties": {
+                  "properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": 1}},
+                  "fields": "gridProperties.frozenRowCount"}})
+              for column, width in enumerate([230, 120, 190, 240]):
+                  requests.append({"updateDimensionProperties": {
+                      "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                                "startIndex": column, "endIndex": column + 1},
+                      "properties": {"pixelSize": width}, "fields": "pixelSize"}})
+              return {"requests": requests}
+          
+          
+          def write_snapshot(rows):
+              print("Stage: authenticate existing Google service account")
+              from google.auth.transport.requests import Request
+              from google.oauth2.service_account import Credentials
+              info = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+              try:
+                  info = json.loads(info)
+              except json.JSONDecodeError:
+                  with open(info, encoding="utf-8") as stream:
+                      info = json.load(stream)
+              credentials = Credentials.from_service_account_info(
+                  info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+              credentials.refresh(Request())
+              base = "https://sheets.googleapis.com/v4/spreadsheets/" + urllib.parse.quote(
+                  os.environ["GOOGLE_SHEET_ID"], safe="")
+              print("Stage: locate existing Calls Data tab")
+              metadata = request_json(base + "?fields=sheets.properties", credentials.token)
+              matches = [s["properties"] for s in metadata["sheets"]
+                         if s["properties"]["title"] == "Calls Data"]
+              if len(matches) != 1:
+                  raise RuntimeError("Expected existing Calls Data tab was not found")
+              batch = build_sheet_update(matches[0], rows)
+              if len(json.dumps(batch).encode()) > 8_000_000:
+                  raise RuntimeError("Snapshot requires staging because its payload exceeds the direct-write limit")
+              print("Stage: atomic Calls Data replacement")
+              request_json(base + ":batchUpdate", credentials.token, batch)
+              # Read back and compare all four columns, including trailing blank rows.
+              print("Stage: verify written snapshot")
+              result = request_json(base + "/values/" + urllib.parse.quote("'Calls Data'!A:D", safe="")
+                                    + "?valueRenderOption=UNFORMATTED_VALUE", credentials.token)
+              actual = [row + [""] * (4 - len(row)) for row in result.get("values", [])]
+              expected = [[cell["userEnteredValue"].get("stringValue",
+                              cell["userEnteredValue"].get("numberValue")) for cell in row["values"]]
+                          for row in batch["requests"][next(i for i,r in enumerate(batch["requests"]) if "updateCells" in r)]
+                              ["updateCells"]["rows"]]
+              if len(actual) != len(expected):
+                  raise RuntimeError("Sheets readback row count differs from written snapshot")
+              for a, e in zip(actual, expected):
+                  for index in range(4):
+                      if index == 2 and isinstance(e[index], (int, float)):
+                          if not isinstance(a[index], (int, float)) or abs(a[index] - e[index]) > 1e-8:
+                              raise RuntimeError("Sheets date readback differs")
+                      elif a[index] != e[index]:
+                          raise RuntimeError("Sheets readback differs from written snapshot")
+          
+          
           def main():
               hubspot_token = os.environ.get("HUBSPOT_ACCESS_TOKEN")
               if not hubspot_token:
@@ -207,23 +305,27 @@ jobs:
               teams = {str(t["id"]): t["name"] for owner in owner_list for t in owner.get("teams", [])}
               for option in schema.get("hubspot_team_id", {}).get("options", []):
                   teams[str(option["value"])] = option["label"]
+              print("Stage: retrieve calls within Activity Date window")
               calls = fetch_calls(api, int(start.timestamp() * 1000), int(end.timestamp() * 1000), properties)
               rows, issues = normalize(calls, owners, teams, start, end)
-              # Data stays in process memory. No CRM rows, counts, or owner/team names in public logs/artifacts.
-              summary = ["## Calls validation: stopped before Google Sheets",
+              if any(issue != "Team derived from assignee current primary team; review mapping" for issue in issues):
+                  raise RuntimeError("Unresolved owner or team mapping; existing sheet preserved")
+              write_snapshot(rows)
+              # No CRM rows, counts, or owner/team names in public logs/artifacts.
+              summary = ["## Calls snapshot written and verified",
                          "Columns: " + " | ".join(HEADERS),
                          "Scope: all assignees and teams; call objects only.",
                          "Timezone: America/Phoenix; preceding 48 hours ending at run-date midnight.",
                          "Destination: existing GOOGLE_SHEET_ID spreadsheet; tab Calls Data.",
-                         "Google Sheets: no connection, clearing, adding, or writing performed.",
+                         "Google Sheets: Calls Data replaced and readback verified.",
                          "CRM record data and counts are not published."]
               if issues:
                   summary += ["Mapping review required:"] + ["- " + issue for issue in issues]
               else:
-                  summary.append("Field mapping validation completed; write stage remains on hold.")
+                  summary.append("Field mapping validation completed; daily Sheets refresh is enabled.")
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
                   stream.write("\n\n".join(summary) + "\n")
-              print("Calls validation completed. Stopped before the Google Sheets write stage.")
+              print("Calls Data snapshot written and readback verified.")
               for issue in issues:
                   print("Mapping review: " + issue)
           
@@ -233,6 +335,6 @@ jobs:
                   main()
               except Exception as exc:
                   # Suppress exception values/tracebacks that might include CRM responses.
-                  print("::error::Calls validation failed (" + type(exc).__name__ + "). No Sheets write was attempted.")
+                  print("::error::Calls refresh failed (" + type(exc).__name__ + "). Check the failed stage before rerunning.")
                   raise SystemExit(1)
           PY
