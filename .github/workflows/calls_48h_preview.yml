@@ -3,6 +3,7 @@ name: Calls 48h - Refresh Calls Data
 on:
   schedule:
     - cron: "0 7 * * *" # Midnight America/Phoenix (UTC-07:00)
+    - cron: "30 0 * * *" # 5:30 PM America/Phoenix (UTC-07:00)
   workflow_dispatch:
 
 permissions:
@@ -28,6 +29,7 @@ jobs:
         env:
           HUBSPOT_ACCESS_TOKEN: ${{ secrets.CALLS_HUBSPOT_ACCESS_TOKEN }}
           GH_TOKEN: ${{ github.token }}
+          SCHEDULE_CRON: ${{ github.event.schedule }}
           GOOGLE_SHEET_ID: ${{ secrets.CALLS_GOOGLE_SHEET_ID }}
           GOOGLE_SHEET_TAB: "Calls Data"
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -88,9 +90,16 @@ jobs:
                       time.sleep(2 ** attempt)
           
           
-          def reporting_window(created_at):
-              anchor = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-              end = anchor.astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+          def reporting_window(created_at, schedule=""):
+              anchor = datetime.fromisoformat(created_at.replace("Z", "+00:00")).astimezone(TZ)
+              midnight = anchor.replace(hour=0, minute=0, second=0, microsecond=0)
+              evening = anchor.replace(hour=17, minute=30, second=0, microsecond=0)
+              if schedule == "0 7 * * *":
+                  end = midnight
+              elif schedule == "30 0 * * *":
+                  end = evening if evening <= anchor else evening - timedelta(days=1)
+              else:
+                  end = evening if evening <= anchor else midnight
               end = end.astimezone(timezone.utc)
               return end - timedelta(hours=48), end
           
@@ -323,7 +332,7 @@ jobs:
               run = request_json(
                   "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"]
                   + "/actions/runs/" + os.environ["GITHUB_RUN_ID"], os.environ["GH_TOKEN"])
-              start, end = reporting_window(run["created_at"])
+              start, end = reporting_window(run["created_at"], os.environ.get("SCHEDULE_CRON", ""))
               def api(path, payload=None):
                   return request_json("https://api.hubapi.com" + path, hubspot_token, payload)
               schema = {p["name"]: p for p in api("/crm/v3/properties/calls")["results"]}
@@ -363,7 +372,7 @@ jobs:
               summary = ["## Calls snapshot written and verified",
                          "Columns: " + " | ".join(HEADERS),
                          "Scope: all assignees and teams; call objects only.",
-                         "Timezone: America/Phoenix; preceding 48 hours ending at run-date midnight.",
+                         "Timezone: America/Phoenix; preceding 48 hours ending at the latest scheduled cutoff (midnight or 17:30).",
                          "Destination: existing GOOGLE_SHEET_ID spreadsheet; tab Calls Data.",
                          "Google Sheets: Calls Data replaced and readback verified.",
                          "CRM record data and counts are not published."]
